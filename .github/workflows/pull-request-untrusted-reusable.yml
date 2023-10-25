@@ -1,0 +1,165 @@
+name: Pull Request Untrusted Workflow
+
+on:
+  workflow_call:
+    inputs:
+      ci_cd_sha:
+        required: false
+        type: string
+
+env:
+  TEST_WORKFLOW_FILE: multi-platform-test.yml
+
+jobs:
+  upload-event-file:
+    # This could be useful for actions inside dispatched workflows, making them feel like being triggered by pull_request event
+    name: "Upload Event File"
+    runs-on: ubuntu-latest
+    steps:
+    - name: Upload
+      uses: actions/upload-artifact@v3
+      with:
+        name: event_file
+        path: ${{ github.event_path }}
+
+
+  handle-syncwhith:
+    name: "Handle SyncWith tag: link to issue, fetch SHAs, trigger related PRs"
+    # This job runs only if the PR is not from a fork to prevent linking
+    if: github.event.pull_request.head.repo.fork == false
+    runs-on: ubuntu-latest
+
+    outputs:
+      fetched-shas: ${{ steps.fetch-shas.outputs.fetched-shas }}
+
+    steps:
+    - name: Dump GitHub context
+      env:
+        GITHUB_CONTEXT: ${{ toJson(github) }}
+      run: echo "$GITHUB_CONTEXT"
+
+    - name: Check if PR title contains SyncWith tag
+      id: fetch-needed
+      run: |
+        count=$(echo "${{ github.event.pull_request.title }}" | grep -o '\[SyncWith' | wc -l)
+        if [[ "$count" -eq 1 ]]; then
+          echo "value=true" >> $GITHUB_OUTPUT
+        elif [[ "$count" -gt 1 ]]; then
+          echo "Error: Multiple 'SyncWith' tags detected in PR title." >&2
+          exit 1
+        else
+          echo "value=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Checkout ci_cd repository
+      if: steps.fetch-needed.outputs.value == 'true'
+      uses: actions/checkout@v4
+      with:
+        repository: NilFoundation/ci-cd
+        ref: ${{ env.CI_CD_SHA }}
+        path: .ci_cd
+
+    - name: Set pip cache
+      if: steps.fetch-needed.outputs.value == 'true'
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+        cache: 'pip'
+
+    - name: Install dependencies
+      if: steps.fetch-needed.outputs.value == 'true'
+      run: |
+        pip3 install PyGithub
+
+    - name: Generate CI/CD bot token
+      id: generate-ci-token
+      if: steps.fetch-needed.outputs.value == 'true'
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.CICD_APP_ID }}
+        private-key: ${{ secrets.CICD_APP_PRIVATE_KEY }}
+
+    - name: Link PR to SyncWith issue
+      if: steps.fetch-needed.outputs.value == 'true'
+      working-directory: .ci_cd/scripts
+      run: |
+        python3 link_to_issue.py \
+          ${{ github.repository }} \
+          ${{ github.event.pull_request.number }}
+      env:
+        CI_TOKEN: ${{ steps.generate-ci-token.outputs.token }}
+
+    - name: Fetch PRs' SHAs for syncing
+      id: fetch-shas
+      if: steps.fetch-needed.outputs.value == 'true'
+      working-directory: .ci_cd/scripts
+      run: |
+        fetched_shas="$(python3 find_commits_for_syncing.py \
+          ${{ github.repository }} \
+          ${{ github.event.pull_request.number }})"
+        echo "fetched-shas=$fetched_shas" >> $GITHUB_OUTPUT
+      env:
+        CI_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Trigger related PRs to rerun test workflow with fetched SHAs
+      if: steps.fetch-needed.outputs.value == 'true'
+      working-directory: .ci_cd/scripts
+      run: |
+        echo "$json_data" | jq -r 'to_entries[] | "\(.key) \(.value.branch)"' | while read -r repo branch; do
+          if [[ "$repo" == "${{ github.repository }}" ]]; then
+            continue
+          fi
+          # escaped_json=$(echo "${{ steps.fetch-shas.outputs.fetched-shas }}" | sed 's/"/\\"/g')
+          echo "Triggering ${{ env.TEST_WORKFLOW_FILE }} workflow for $repo (branch: $branch)"
+          gh api repos/${{ github.repository }}/actions/workflows/${{ env.TEST_WORKFLOW_FILE }}/dispatches \
+            -X POST \
+            -f ref='${{ github.head_ref }}' \
+            -f 'inputs[submodules_json]=${{ needs.handle-syncwhith.outputs.fetched-shas }}'
+          gh api repos/$repo/actions/workflows/${{ env.TEST_WORKFLOW_FILE }}/dispatches \
+            -X POST \
+            -F ref="$branch" \
+            -F 'inputs[submodules_json]=${{ steps.fetch-shas.outputs.fetched-shas }}'
+        done
+      env:
+        GH_TOKEN: ${{ steps.generate-ci-token.outputs.token }}
+
+
+  dispatch-test-workflow:
+    name: Dispatch testing workflow
+    needs:
+      - handle-syncwhith
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Generate CI/CD bot token
+      id: generate-ci-token
+      uses: actions/create-github-app-token@v1
+      with:
+        app-id: ${{ secrets.CICD_APP_ID }}
+        private-key: ${{ secrets.CICD_APP_PRIVATE_KEY }}
+
+    - name: Set Pending Test Status
+      run: |
+        gh api repos/${{ github.repository }}/statuses/${{ github.event.pull_request.head.sha }} \
+          -X POST \
+          -f state=pending \
+          -f context='Matrix Tests' \
+          -f description='Tests are running' \
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Dispatch Workflow
+      run: |
+        # argjson makes it a number instead of string
+        callback_json=$(jq -n \
+          --argjson pr_run_id "${{ github.run_id }}" \
+          --arg triggered_by "pr" \
+          '{triggered_by: $triggered_by, pr_run_id: $pr_run_id}')
+
+        gh api repos/${{ github.repository }}/actions/workflows/${{ env.TEST_WORKFLOW_FILE }}/dispatches \
+            -X POST \
+            -f ref='${{ github.head_ref }}' \
+            -f 'inputs[submodules_json]=${{ needs.handle-syncwhith.outputs.fetched-shas }}' \
+            -f "inputs[callback_json]=$callback_json"
+      env:
+        GITHUB_TOKEN: ${{ steps.generate-ci-token.outputs.token }}
